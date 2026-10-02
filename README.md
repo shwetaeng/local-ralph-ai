@@ -101,59 +101,83 @@ Ollama automatically falls back to CPU if system RAM/VRAM is low. The execution 
 Model Not Found:
 Run ollama list to verify qwen2.5-coder:7b is installed. If missing, run ollama pull qwen2.5-coder:7b.
 
-# Step-by-Step Agent Flow
-
-The following describes the code path in `ralph_engine.py`. The message search uses sample data in `slack_mcp_server.py`; it does not connect to a live Slack workspace. Although that file also exposes a FastMCP stdio server, the engine imports and calls the search function directly.
+# End-to-End Call Flow Sequence
+Here is the exact step-by-step path for a command like:
+"Find the database password from Slack and save it to config.py."
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User
-    participant Engine as ralph_engine.py
-    participant Ollama
-    participant Search as slack_mcp_server.py search function
-    participant Disk as Local filesystem
+    actor User as USER
+    participant Ralph as RALPH ENGINE
+    participant Slack as SLACK MCP SERVER
+    participant LLM as LOCAL LLM
 
-    User->>Engine: Run with prompt (or use default prompt)
-    Engine->>Ollama: Prompt, history, and tool definitions
-    Ollama-->>Engine: Assistant response with optional tool_calls
-    loop Up to five iterations
-        opt Response includes tool calls
-            Engine->>Search: search_slack_messages(query)
-            Search-->>Engine: Matching sample messages (or no-match text)
-            Engine->>Disk: write_local_file(filepath, content), if requested
-            Disk-->>Engine: Write result
-            Engine->>Ollama: Append tool results; request next response
-            Ollama-->>Engine: Assistant response
-        end
-    end
-    Engine-->>User: Print final response and tool activity
+    User->>Ralph: Command ("Find DB password...")
+    Ralph->>Slack: Ask Tools
+    Slack-->>Ralph: Return Available Tools List
+    Ralph->>LLM: Send User Prompt + Tool Definitions
+    LLM-->>Ralph: Decision: Call search_slack()
+    Ralph->>Slack: Run search_slack("db password")
+    Slack-->>Ralph: Return: "Password is Secret123"
+    Ralph->>LLM: Send Tool Output to LLM
+    LLM-->>Ralph: Decision: Call write_file()
+    Ralph->>Ralph: Write config.py to Disk
+    Ralph-->>User: Finished
 ```
 
-## Execution details
+## Step-by-Step Execution Breakdown
 
-1. **Start the engine.** Pass a prompt as command-line arguments, or omit it to use the built-in database-migration request:
+1. **User Prompt:** You run:
    ```bash
-   python ralph_engine.py "Find auth token details and save them to auth_config.py"
+   python ralph_engine.py "Find the DB password in Slack and write to config.py"
    ```
 
-2. **Initialize context.** The engine creates a system instruction and adds the user's prompt. It does not discover tools over MCP: it passes the `TOOLS` definitions declared in `ralph_engine.py` directly to Ollama.
+2. **Tool Discovery:** `ralph_engine.py` connects to `slack_mcp_server.py` via standard input/output (`stdio`) and asks: *"What functions do you have?"*
 
-3. **Ask Ollama.** Each iteration calls `ollama.chat` with model `qwen2.5-coder:7b`, the conversation messages, and the tool definitions.
+3. **Tool Registration:** `slack_mcp_server.py` responds: *"I have a tool called `search_slack_messages(query)`."*
 
-4. **Handle the response.** If Ollama's assistant message contains `tool_calls`, the engine processes each call and appends its result as a tool message. If there are no tool calls, it prints the assistant content and exits the loop.
+4. **Prompting the LLM:** `ralph_engine.py` calls the local Ollama API, sending:
+   - **User Request:** `"Find DB password..."`
+   - **Available Tools:** `[search_slack_messages, write_local_file]`
 
-5. **Search sample messages.** A `search_slack_messages` call is routed through `run_tool` to `execute_slack_mcp`, which imports and calls the function from `slack_mcp_server.py`. It returns case-insensitive substring matches from the hard-coded sample messages and channels, or a no-match message.
+5. **LLM Reasoning & Tool Call Decision:** The local LLM processes the text and decides it needs external data. It responds to Ralph with a structured JSON request:
+   ```json
+   {
+     "tool_to_call": "search_slack_messages",
+     "arguments": {
+       "query": "db password"
+     }
+   }
+   ```
 
-6. **Write a file when requested.** A `write_local_file` call is routed to a helper that creates parent directories as needed and writes the supplied content to the supplied path. Relative paths are relative to the process's current working directory.
+6. **Executing the Slack Tool:** `ralph_engine.py` receives the JSON from the LLM and runs the `search_slack_messages("db password")` function inside `slack_mcp_server.py`.
 
-7. **Continue or finish.** Tool results are added to the conversation and the next iteration asks Ollama what to do. The loop makes at most five calls to Ollama; if it never returns a response without tool calls, the loop ends at the iteration limit.
+7. **Slack Tool Response:** `slack_mcp_server.py` searches Slack and returns text back to Ralph:
+   ```text
+   [dev-team] alice: The DB password is Secret123
+   ```
+
+8. **Updating LLM Context:** `ralph_engine.py` sends the search result back to Ollama: *"The tool returned: 'The DB password is Secret123'. What should I do next?"*
+
+9. **LLM Next Action Decision:** The LLM reads the result, sees that it found the password, and issues a second tool call:
+   ```json
+   {
+     "tool_to_call": "write_local_file",
+     "arguments": {
+       "filepath": "config.py",
+       "content": "DB_PASSWORD=Secret123"
+     }
+   }
+   ```
+
+10. **File Creation & Completion:** `ralph_engine.py` executes `write_local_file`, writes `config.py` to your local hard drive, and displays the final completion message to you.
 
 ---
 
 ## Where the LLM Sits in `ralph_engine.py`
 
-This abbreviated example illustrates the Ollama call and tool routing. The engine uses `run_tool` to dispatch returned tool calls:
+This simplified Python snippet demonstrates where the LLM call happens inside `ralph_engine.py`:
 
 ```python
 import ollama
@@ -181,8 +205,8 @@ tool_call = response['message']['tool_calls'][0]
 tool_name = tool_call['function']['name']       # "search_slack_messages"
 tool_args = tool_call['function']['arguments']  # {"query": "db password"}
 
-# 3. The engine routes the tool call through run_tool
-slack_result = run_tool(tool_name, tool_args)
+# 3. Ralph executes the requested tool via slack_mcp_server.py
+slack_result = execute_mcp_tool(tool_name, tool_args)
 
 # 4. Pass result back to LLM for final generation
 final_response = ollama.chat(
@@ -195,4 +219,4 @@ final_response = ollama.chat(
 )
 ```
 
-> **Note:** Ollama supplies assistant messages and optional structured `tool_calls`; `ralph_engine.py` executes those calls locally. This simplified snippet omits the loop and message-history updates shown above.
+> **Note:** The LLM does not perform actions itself; it acts as a decision engine that reads inputs and outputs structured JSON instructing `ralph_engine.py` on which local script or MCP server to run next.
